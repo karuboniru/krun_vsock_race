@@ -1,179 +1,35 @@
-/* Standalone libkrun Unix/vsock "close with unread data" reproducer.
+/* Host-side harness shared by both libkrun backends.
  *
- * The same source is built twice (see CMakeLists.txt / README.md):
- *   vsock-tail        host process that embeds libkrun and plays the client
- *   vsock-tail-guest  statically linked guest that plays the server
- *
- * Host modes:
+ * Modes:
  *   close      freeze the VMM, write the payload, close the socket, resume it
- *   keep-open  write the payload and keep the socket open until the guest ACKs
- *   race       write the payload and close immediately, repeating ROUNDS times
- *              on fresh connections of a single VM
+ *   keep-open  write the payload and hold the socket open until the guest ACKs
+ *   race       write the payload and close immediately, once per fresh
+ *              connection, repeating ROUNDS times on a single VM
  *
- * `close` is the deterministic reproduction: freezing every VMM thread makes
- * the kernel see the write and the hangup together, so the tail is always lost.
- * `keep-open` is its control: the same write, but the socket survives until the
- * guest has drained it, so nothing is lost. `race` never signals the VMM at all;
- * it replays the same write-then-close pattern an ordinary client performs and
- * reports how often the tail is lost.
+ * `close` is the deterministic reproduction: freezing every VMM thread makes the
+ * kernel see the write and the hangup together. `keep-open` is its control.
+ * `race` never signals the VMM and reports how often an ordinary write-then-close
+ * loses data.
  *
- * No agent-vm code is used.
+ * A backend only has to provide the `run` hook from struct vm_backend; the VM is
+ * always forked so the harness can stop, resume and kill it.
  */
-#define _GNU_SOURCE
-#include <errno.h>
+#ifndef VSOCK_TAIL_HARNESS_H
+#define VSOCK_TAIL_HARNESS_H
+
 #include <fcntl.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <time.h>
-#include <unistd.h>
-
-#define VSOCK_PORT 5000
-#define RESULT_PATH "/result"
-#define DEFAULT_PAYLOAD_SIZE (16UL * 1024)
-#define MAX_PAYLOAD_SIZE (64UL * 1024 * 1024)
-#define DEFAULT_ROUNDS 20UL
-#define MAX_ROUNDS 100000UL
-#define MAX_DELAY_US 1000000UL
-#define SOCKET_TIMEOUT_SECONDS 15
-/* `close` freezes the VMM between write and close, so the payload has to fit in
- * the socket buffer or the write could never be drained. */
-#define CLOSE_MAX_PAYLOAD (128UL * 1024)
-
-static void die(const char *what)
-{
-    perror(what);
-    exit(2);
-}
-
-/* Write the whole buffer, retrying on short writes and EINTR. */
-static void send_all(int fd, const void *data, size_t length)
-{
-    const char *p = data;
-    while (length) {
-        ssize_t n = send(fd, p, length, MSG_NOSIGNAL);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) die("send");
-        p += n;
-        length -= (size_t)n;
-    }
-}
-
-static void timeout_socket(int fd)
-{
-    struct timeval timeout = {.tv_sec = SOCKET_TIMEOUT_SECONDS};
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ||
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)))
-        die("socket timeout");
-}
-
-/* ------------------------------------------------------------------ guest */
-
-#ifdef REPRO_GUEST
-#include <linux/vm_sockets.h>
-
-static unsigned long guest_payload_size = DEFAULT_PAYLOAD_SIZE;
-static unsigned long guest_rounds = 1;
-static int guest_acknowledge;
-static FILE *result_file;
-
-static int connect_to_host(void)
-{
-    int fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) die("guest socket");
-    timeout_socket(fd);
-    struct sockaddr_vm address = {
-        .svm_family = AF_VSOCK, .svm_port = VSOCK_PORT, .svm_cid = VMADDR_CID_HOST
-    };
-    if (connect(fd, (struct sockaddr *)&address, sizeof(address))) die("guest connect");
-    send_all(fd, "R", 1); /* readiness byte: the host waits for it before writing */
-    return fd;
-}
-
-/* Drain one payload from fd. Returns non-zero when bytes were lost or corrupt.
- * The result is appended to the file so the host can tell a data loss apart
- * from a VM that failed to boot. */
-static int drain_payload(int fd, unsigned long round)
-{
-    unsigned char chunk[4096];
-    size_t received = 0;
-    int saved_errno = 0, bad_data = 0;
-    const char *ended = "complete";
-
-    while (received < guest_payload_size) {
-        ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            saved_errno = n < 0 ? errno : 0;
-            ended = n == 0 ? "EOF" : "recv error";
-            break;
-        }
-        for (ssize_t i = 0; i < n; ++i)
-            if (chunk[i] != (unsigned char)((received + (size_t)i) % 251)) bad_data = 1;
-        received += (size_t)n;
-    }
-
-    int failed = received != guest_payload_size || bad_data;
-    printf("GUEST: round=%lu expected=%lu received=%zu missing=%zu end=%s errno=%d (%s) bad_data=%d\n",
-           round, guest_payload_size, received, guest_payload_size - received,
-           ended, saved_errno, strerror(saved_errno), bad_data);
-    fprintf(result_file, "%lu %d %zu\n", round, failed ? 1 : 0, received);
-    if (fflush(result_file)) die("guest result flush");
-    if (!failed && guest_acknowledge) (void)send(fd, "A", 1, MSG_NOSIGNAL);
-    return failed;
-}
-
-/* libkrun may or may not prepend exec_path as argv[0], so read the trailing
- * arguments the host always supplies and ignore any leading program path. */
-int main(int argc, char **argv)
-{
-    setbuf(stdout, NULL);
-
-    const char *mode = "close";
-    if (argc >= 4) {
-        mode = argv[argc - 3];
-        guest_rounds = strtoul(argv[argc - 2], NULL, 10);
-        guest_payload_size = strtoul(argv[argc - 1], NULL, 10);
-    }
-    if (!guest_rounds || !guest_payload_size) return 2;
-    guest_acknowledge = !strcmp(mode, "keep-open");
-
-    result_file = fopen(RESULT_PATH, "w");
-    if (!result_file) die("guest result file");
-
-    int failures = 0;
-    for (unsigned long round = 1; round <= guest_rounds; ++round) {
-        int fd = connect_to_host();
-        failures += drain_payload(fd, round);
-        close(fd);
-    }
-
-    if (fclose(result_file)) die("guest result close");
-    return failures ? 1 : 0;
-}
-
-/* ------------------------------------------------------------------- host */
-
-#else
 #include <ftw.h>
 #include <limits.h>
+#include <signal.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <libkrun.h>
+#include <time.h>
+#include "common.h"
 
 enum mode { MODE_CLOSE, MODE_KEEP_OPEN, MODE_RACE, MODE_COUNT };
-
 static const char *const mode_names[MODE_COUNT] = {"close", "keep-open", "race"};
-
-static const char temporary_template[] = "/tmp/krun-tail-XXXXXX";
-static char temporary[sizeof(temporary_template)];
-static pid_t vm_pid = -1;
-static int have_temporary;
 
 struct round_result {
     unsigned long round;
@@ -181,31 +37,53 @@ struct round_result {
     size_t received;
 };
 
-/* The payload is a fixed byte pattern so the guest can detect corruption. */
-static void fill_payload(unsigned char *payload, size_t length)
-{
-    for (size_t i = 0; i < length; ++i) payload[i] = (unsigned char)(i % 251);
-}
+struct run_stats {
+    unsigned long long transfer_us; /* whole loop, excluding VM boot */
+    unsigned long long total_send_us;
+    unsigned long long max_send_us; /* slowest single round's write */
+};
+
+struct options {
+    const char *guest_binary;
+    enum mode mode;
+    unsigned long rounds;
+    unsigned long delay_us;
+    unsigned long payload_size;
+};
+
+/* Backend contract: run the VMM until the guest exits. Called in the forked
+ * child, so it never returns on success. */
+struct vm_backend {
+    void (*run)(const char *root, const char *socket_path, const char *mode,
+                unsigned long rounds, unsigned long payload_size);
+    const char *name;
+};
+
+static const char temporary_template[] = "/tmp/krun-tail-XXXXXX";
+static char temporary[sizeof(temporary_template)];
+static pid_t vm_pid = -1;
+static int have_temporary;
 
 static unsigned long long now_us(void)
 {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now)) die("clock_gettime");
-    return (unsigned long long)now.tv_sec * 1000000ULL + (unsigned long long)now.tv_nsec / 1000ULL;
+    return (unsigned long long)now.tv_sec * 1000000ULL +
+           (unsigned long long)now.tv_nsec / 1000ULL;
 }
 
 /* Busy-wait instead of sleeping: nanosleep rounds sub-millisecond delays up to
  * the timer slack (tens of microseconds), which would hide the race window. */
 static void spin_us(unsigned long delay_us)
 {
-    struct timespec start, now;
-    if (clock_gettime(CLOCK_MONOTONIC, &start)) die("clock_gettime");
-    for (;;) {
-        if (clock_gettime(CLOCK_MONOTONIC, &now)) die("clock_gettime");
-        long long elapsed = (long long)(now.tv_sec - start.tv_sec) * 1000000LL +
-                            (long long)(now.tv_nsec - start.tv_nsec) / 1000LL;
-        if (elapsed >= (long long)delay_us) return;
-    }
+    unsigned long long deadline = now_us() + delay_us;
+    while (now_us() < deadline) {}
+}
+
+/* The payload is a fixed byte pattern so the guest can detect corruption. */
+static void fill_payload(unsigned char *payload, size_t length)
+{
+    for (size_t i = 0; i < length; ++i) payload[i] = (unsigned char)(i % 251);
 }
 
 /* Remove the whole temporary tree, including the guest root. */
@@ -235,12 +113,6 @@ static void expired(int sig)
     const char message[] = "HOST: timed out; temporary files may remain in /tmp/krun-tail-*\n";
     (void)write(STDERR_FILENO, message, sizeof(message) - 1);
     _exit(124);
-}
-
-/* libkrun entry points return a negative errno. */
-static void check(int result, const char *what)
-{
-    if (result < 0) { errno = -result; die(what); }
 }
 
 static void copy_file(const char *source, const char *target)
@@ -275,10 +147,21 @@ static void unix_address(struct sockaddr_un *address, const char *path)
     memcpy(address->sun_path, path, strlen(path) + 1);
 }
 
-/* Fork the VMM process. The guest runs all rounds on its own, so every mode
- * boots exactly one VM no matter how many connections it uses. */
-static void start_vm(const char *root, const char *socket_path, int listener,
-                     const char *mode, unsigned long rounds, unsigned long payload_size)
+static int create_listener(const char *socket_path)
+{
+    struct sockaddr_un address;
+    unix_address(&address, socket_path);
+    int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0) die("host socket");
+    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) || listen(listener, 8))
+        die("host listen");
+    return listener;
+}
+
+/* Fork the backend and let it run the VMM until the guest exits. */
+static void start_vm(const struct vm_backend *backend, const char *root,
+                     const char *socket_path, int listener, const char *mode,
+                     unsigned long rounds, unsigned long payload_size)
 {
     vm_pid = fork();
     if (vm_pid < 0) die("fork");
@@ -297,36 +180,9 @@ static void start_vm(const char *root, const char *socket_path, int listener,
                 close(devnull);
             }
         }
-
-        char rounds_text[32], payload_text[32];
-        snprintf(rounds_text, sizeof(rounds_text), "%lu", rounds);
-        snprintf(payload_text, sizeof(payload_text), "%lu", payload_size);
-
-        int ctx = krun_create_ctx();
-        check(ctx, "krun_create_ctx");
-        check(krun_set_vm_config(ctx, 1, 256), "krun_set_vm_config");
-        check(krun_set_root(ctx, root), "krun_set_root");
-        check(krun_disable_implicit_vsock(ctx), "krun_disable_implicit_vsock");
-        check(krun_add_vsock(ctx, 0), "krun_add_vsock");
-        check(krun_add_vsock_port2(ctx, VSOCK_PORT, socket_path, false), "krun_add_vsock_port2");
-        const char *args[] = {mode, rounds_text, payload_text, NULL};
-        const char *env[] = {"PATH=/", "HOME=/", "panic=-1", "oops=panic", NULL};
-        check(krun_set_workdir(ctx, "/"), "krun_set_workdir");
-        check(krun_set_exec(ctx, "/guest", args, env), "krun_set_exec");
-        check(krun_start_enter(ctx), "krun_start_enter");
-        _exit(2);
+        backend->run(root, socket_path, mode, rounds, payload_size);
+        _exit(2); /* only reached if a backend fails before starting the VM */
     }
-}
-
-static int create_listener(const char *socket_path)
-{
-    struct sockaddr_un address;
-    unix_address(&address, socket_path);
-    int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (listener < 0) die("host socket");
-    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) || listen(listener, 8))
-        die("host listen");
-    return listener;
 }
 
 /* Accept one guest connection and wait for its readiness byte. */
@@ -345,9 +201,9 @@ static int accept_ready(int listener)
     return stream;
 }
 
-/* Stop every VMM thread so libkrun cannot drain the Unix socket between the
+/* Stop every VMM thread so the VMM cannot drain the Unix socket between the
  * write and the close. This is what makes the IN|HUP combination deterministic
- * for the close/keep-open control modes. */
+ * for the close control. */
 static void stop_vm(void)
 {
     if (kill(vm_pid, SIGSTOP)) die("SIGSTOP");
@@ -357,6 +213,11 @@ static void stop_vm(void)
         cleanup();
         exit(2);
     }
+}
+
+static void resume_vm(void)
+{
+    if (kill(vm_pid, SIGCONT)) die("SIGCONT");
 }
 
 /* Read the per-round lines the guest wrote before exiting. */
@@ -383,17 +244,18 @@ static void read_results(const char *result_path, struct round_result *results,
     }
 }
 
-static void usage(const char *program)
+static void usage(const char *program, const char *backend_name)
 {
     fprintf(stderr,
             "Usage: %s STATIC_GUEST_BINARY MODE [ROUNDS] [DELAY_US] [--payload SIZE]\n"
             "  close      one round; freeze the VMM, write the payload, close, resume\n"
-            "  keep-open  one round; write the payload, keep the socket open until the ACK\n"
-            "  race       ROUNDS (default %lu) fresh connections on one VM; the VMM is\n"
-            "             never frozen and each socket is closed right after the write\n"
+            "  keep-open  one round; write the payload, hold the socket open until the ACK\n"
+            "  race       ROUNDS (default %lu) fresh connections on one VM; the VM is not\n"
+            "             suspended and each socket is closed right after the write\n"
             "  DELAY_US   spin between send and close to widen the drain window (race only)\n"
-            "  --payload SIZE   payload bytes per round (default %lu)\n",
-            program, DEFAULT_ROUNDS, DEFAULT_PAYLOAD_SIZE);
+            "  --payload SIZE   payload bytes per round (default %lu)\n"
+            "Built against %s.\n",
+            program, DEFAULT_ROUNDS, DEFAULT_PAYLOAD_SIZE, backend_name);
 }
 
 static unsigned long parse_number(const char *text, const char *what, unsigned long maximum)
@@ -408,17 +270,10 @@ static unsigned long parse_number(const char *text, const char *what, unsigned l
     return value;
 }
 
-struct options {
-    const char *guest_binary;
-    enum mode mode;
-    unsigned long rounds;
-    unsigned long delay_us;
-    unsigned long payload_size;
-};
-
-static void parse_options(int argc, char **argv, struct options *options)
+static void parse_options(int argc, char **argv, struct options *options,
+                          const char *backend_name)
 {
-    if (argc < 3) { usage(argv[0]); exit(2); }
+    if (argc < 3) { usage(argv[0], backend_name); exit(2); }
     options->guest_binary = argv[1];
     options->rounds = 0;
     options->delay_us = 0;
@@ -427,13 +282,13 @@ static void parse_options(int argc, char **argv, struct options *options)
     int mode_index = -1;
     for (int i = 0; i < MODE_COUNT; ++i)
         if (!strcmp(argv[2], mode_names[i])) { mode_index = i; break; }
-    if (mode_index < 0) { usage(argv[0]); exit(2); }
+    if (mode_index < 0) { usage(argv[0], backend_name); exit(2); }
     options->mode = (enum mode)mode_index;
 
     unsigned long positional = 0;
     for (int i = 3; i < argc; ++i) {
         if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--payload")) {
-            if (++i == argc) { usage(argv[0]); exit(2); }
+            if (++i == argc) { usage(argv[0], backend_name); exit(2); }
             options->payload_size = parse_number(argv[i], "payload size", MAX_PAYLOAD_SIZE);
         } else if (positional == 0) {
             options->rounds = parse_number(argv[i], "ROUNDS", MAX_ROUNDS);
@@ -442,7 +297,7 @@ static void parse_options(int argc, char **argv, struct options *options)
             options->delay_us = parse_number(argv[i], "DELAY_US", MAX_DELAY_US);
             positional++;
         } else {
-            usage(argv[0]);
+            usage(argv[0], backend_name);
             exit(2);
         }
     }
@@ -458,19 +313,14 @@ static void parse_options(int argc, char **argv, struct options *options)
     } else if (!options->rounds) {
         options->rounds = DEFAULT_ROUNDS;
     }
-    if (!options->payload_size) { usage(argv[0]); exit(2); }
+    if (!options->payload_size) { usage(argv[0], backend_name); exit(2); }
     if (options->mode == MODE_CLOSE && options->payload_size > CLOSE_MAX_PAYLOAD) {
-        fprintf(stderr, "HOST: close freezes the VMM while writing, so its payload must be at most %lu bytes\n",
+        fprintf(stderr,
+                "HOST: close freezes the VMM while writing, so its payload must be at most %lu bytes\n",
                 CLOSE_MAX_PAYLOAD);
         exit(2);
     }
 }
-
-struct run_stats {
-    unsigned long long transfer_us; /* whole loop, excluding VM boot */
-    unsigned long long total_send_us;
-    unsigned long long max_send_us; /* slowest single round's write */
-};
 
 /* Drive the host half of every round; the guest reads the matching results. */
 static void run_rounds(const struct options *options, int listener,
@@ -492,7 +342,7 @@ static void run_rounds(const struct options *options, int listener,
             printf("HOST: mode=close sent=%lu bytes while the VMM was frozen (write took %llu us)\n",
                    options->payload_size, send_us);
             close(stream);
-            if (kill(vm_pid, SIGCONT)) die("SIGCONT");
+            resume_vm();
             continue;
         }
 
@@ -514,7 +364,7 @@ static void run_rounds(const struct options *options, int listener,
             continue;
         }
 
-        /* race: no signal is sent to the VMM, the close races libkrun's drain */
+        /* race: no signal is sent to the VMM, the close races the VMM's drain */
         unsigned long long send_started = now_us();
         send_all(stream, payload, options->payload_size);
         unsigned long long send_us = now_us() - send_started;
@@ -529,17 +379,18 @@ static void run_rounds(const struct options *options, int listener,
     stats->max_send_us = max_send_us;
 }
 
-int main(int argc, char **argv)
+/* Whole-host driver: build the temporary root, run the rounds, collect results. */
+static int harness_main(int argc, char **argv, const struct vm_backend *backend)
 {
     struct options options;
-    parse_options(argc, argv, &options);
+    parse_options(argc, argv, &options, backend->name);
 
     setbuf(stdout, NULL);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGALRM, expired);
     atexit(cleanup);
 
-    /* Boot plus transfers; generous enough for slow CI, bounded for the hang. */
+    /* Boot plus transfers; generous enough for slow CI, bounded for a hang. */
     unsigned long timeout = 60 + (options.rounds > 600 ? 600 : options.rounds);
     timeout += options.payload_size / (1024 * 1024);
     alarm((unsigned)timeout);
@@ -565,8 +416,9 @@ int main(int argc, char **argv)
     if (!results) die("calloc results");
 
     int listener = create_listener(socket_path);
-    start_vm(root, socket_path, listener, mode_names[options.mode],
+    start_vm(backend, root, socket_path, listener, mode_names[options.mode],
              options.rounds, options.payload_size);
+
     struct run_stats stats = {0, 0, 0};
     run_rounds(&options, listener, payload, &stats);
 
@@ -608,4 +460,5 @@ int main(int argc, char **argv)
     }
     return failed ? 1 : 0;
 }
-#endif
+
+#endif /* VSOCK_TAIL_HARNESS_H */
